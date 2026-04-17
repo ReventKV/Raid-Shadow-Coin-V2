@@ -1,28 +1,35 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
-import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
-import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatibleInterface.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol"; 
+import {VRFV2PlusClient} from "@chainlink-brownie/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {AutomationCompatibleInterface} from "@chainlink-brownie/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
+import {IVRFCoordinatorV2Plus} from "@chainlink-brownie/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPool} from "./interfaces/IPool.sol"; // Интерфейс Aave V3
 
-contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuard {
+contract DungeonCore is
+         Initializable, 
+    UUPSUpgradeable, 
+    OwnableUpgradeable, 
+    PausableUpgradeable, 
+    ReentrancyGuard, 
+    AutomationCompatibleInterface {
     
     //Переменные для Стейкинга
     IERC20 public asset;
     IPool public pool;
 
-    // Переменные Chainlink VRF
+    //
+    IVRFCoordinatorV2Plus public s_vrfCoordinator;
     uint256 public s_subscriptionId;
     bytes32 public keyHash;
-    uint32 public callbackGasLimit = 100000;
-
-    //
+    uint32 public callbackGasLimit;
+    
     enum RaidStatus { Open, Closed, Finished }
 
     struct Adventurer {
@@ -68,22 +75,20 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
         
         // Инициализация базовых контрактов OpenZeppelin
         __Ownable_init(_initialOwner);
-        __UUPSUpgradeable_init();
         __Pausable_init();
-        __ReentrancyGuard_init();
         
         // Инициализация Chainlink VRF (вызов конструктора базового класса вручную)
         // В новых версиях VRFConsumerBaseV2Plus это делается через внутренние переменные
         s_vrfCoordinator = IVRFCoordinatorV2Plus(_vrfCoordinator);
         s_subscriptionId = _subscriptionId;
         keyHash = _keyHash;
+        callbackGasLimit = 300000;
 
         //Инициализация что и куда кладётся для стейкинга
         asset = IERC20(_asset);
         pool = IPool(_aavePool);
 
-        // Начальные игровые параметры
-        maxBoost = _defaultMaxBoost;
+
         currentRaidId = 0;
 
         // Одобряем пул Aave на бесконечный вывод
@@ -96,7 +101,7 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
         require(raids[_raidId].status == _status, "Invalid raid status");
         _;
     }
-
+    
     /// @notice Вход в рейд с расчетом временного буста
     function enterRaid(uint256 _amount) 
         external 
@@ -148,7 +153,7 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
         override {
         Raid storage raid = raids[currentRaidId];
         require(block.timestamp >= raid.endTime && raid.status == RaidStatus.Open, "Condition not meet: too early or too late");
-        
+        if (raid.totalRealDeposits > 0 ) {raid.status = RaidStatus.Closed; return;} 
         raid.status = RaidStatus.Closed;
 
         // Запрос случайного числа у Chainlink VRF
@@ -162,12 +167,24 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
                 extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
             })
         );
+
+        vrfRequestToRaid[requestId] = currentRaidId;
     }
 
-    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
+   /**
+     * @dev Эту функцию вызывает VRFCoordinator. 
+     * Мы реализуем её вручную, чтобы избежать конфликтов наследования.
+     */
+    function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
+        if (msg.sender != address(s_vrfCoordinator)) revert("Only Coordinator can fulfill");
+        fulfillRandomWords(requestId, randomWords);
+    }
+
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal {
         uint256 raidId = vrfRequestToRaid[requestId];
         Raid storage raid = raids[raidId];
-        
+        if (raid.status != RaidStatus.Closed) return;
+
         uint256 winningTicket = randomWords[0] % raid.totalWeightedPower;
         uint256 cumulativePower = 0;
         address winner;
@@ -184,6 +201,7 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
         raid.winner = winner;
         _finishRaid(raidId);
     }
+    
 
     function _finishRaid(uint256 _raidId) internal {
         Raid storage raid = raids[_raidId];
@@ -235,19 +253,9 @@ contract DungeonCore is Initializable, UUPSUpgradeable, OwnableUpgradeable, Reen
 
         emit RaidStarted(currentRaidId, newRaid.endTime, _maxBoost);
     }   
-    // Внутренняя функция для UUPS прокси 
-    function startNewRaid(uint256 _duration, uint256 _maxBoost) external onlyOwner {
-        require(currentRaidId == 0 || raids[currentRaidId].status == RaidStatus.Finished, "Previous raid active");
-        currentRaidId++;
-        Raid storage r = raids[currentRaidId];
-        r.startTime = block.timestamp;
-        r.endTime = block.timestamp + _duration;
-        r.maxBoost = _maxBoost;
-        r.status = RaidStatus.Open;
-        emit RaidStarted(currentRaidId, r.endTime, _maxBoost);
-    }
+
 
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal virtual override onlyOwner {}
 }
