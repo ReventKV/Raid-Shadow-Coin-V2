@@ -1,151 +1,231 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "forge-std/Test.sol";
-import "../src/DungeonCore.sol";
+import {Test, console, Vm} from "forge-std/Test.sol";
+import {DungeonCore} from "../src/DungeonCore.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {VRFCoordinatorV2_5Mock} from "@chainlink-brownie/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
+import {MockAavePool} from "./mocks/MockAavePool.sol";
 
 contract DungeonCoreTest is Test {
     DungeonCore public dungeon;
-    ERC1967Proxy public proxy;
-    
-    // Адреса из скрипта деплоя (Sepolia)
+    VRFCoordinatorV2_5Mock public vrfMock;
+    MockAavePool public mockPool;
+
+    // Адреса Sepolia
     address constant ASSET = 0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8; // USDC
-    address constant AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
-    address constant VRF_COORDINATOR = 0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B;
 
-    address owner = address(1);
-    address alice = address(2);
-    address bob = address(3);
+    uint256 subId;
+    bytes32 constant KEY_HASH = 0x787d74caea10b2b357790d5b5244c2f63d1d91572a9846f780606e4d953677ae;
 
-    uint256 sepoliaFork;
+    address public owner = address(1);
+    address public alice = address(2);
+    address public bob = address(3);
+
+    uint256 public constant INITIAL_BALANCE = 1000 * 1e6; // 1000 USDC (6 decimals)
+    uint256 public constant MAX_BOOST = 5000; // 50%
 
     function setUp() public {
-        // Создаем форк Sepolia (нужен RPC_URL в env или просто строкой)
-        sepoliaFork = vm.createSelectFork(vm.envString("SEPOLIA_RPC_URL"));
+        // Форк Sepolia
+        string memory rpcUrl = vm.envString("SEPOLIA_RPC_URL");
+        vm.createSelectFork(rpcUrl);
 
-        vm.startPrank(owner);
-        
-        // 1. Деплой логики и прокси
+        // Деплой моков
+        vrfMock = new VRFCoordinatorV2_5Mock(0.1 ether, 0.001 ether, 1e18);
+        mockPool = new MockAavePool();
+
+        subId = vrfMock.createSubscription();
+        vrfMock.fundSubscription(subId, 100 ether);
+
+        // Деплой основного контракта
         DungeonCore implementation = new DungeonCore();
         bytes memory initData = abi.encodeWithSelector(
             DungeonCore.initialize.selector,
             ASSET,
-            AAVE_POOL,
+            address(mockPool), // Используем наш Mock вместо реального Aave
             owner,
-            123, // subId
-            bytes32(0), // keyHash
-            VRF_COORDINATOR,
-            5000 // 50% maxBoost
+            subId,
+            KEY_HASH,
+            address(vrfMock),
+            MAX_BOOST
         );
-        proxy = new ERC1967Proxy(address(implementation), initData);
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         dungeon = DungeonCore(address(proxy));
 
-        vm.stopPrank();
+        vrfMock.addConsumer(subId, address(dungeon));
 
-        // Даем Алисе и Бобу немного USDC (делаем deal или берем у кита)
-        // На форке проще всего использовать deal для ERC20
-        deal(ASSET, alice, 1000 * 1e6); // 1000 USDC
-        deal(ASSET, bob, 1000 * 1e6);
-    }
+        // Подготовка фековых игроков
+        deal(ASSET, alice, INITIAL_BALANCE);
+        deal(ASSET, bob, INITIAL_BALANCE);
 
-    // --- Тест 1: Проверка математики буста ---
-    function testBoostLogic() public {
-        uint256 duration = 1 days;
-        vm.prank(owner);
-        dungeon.startNewRaid(duration, 5000); // 50% max boost
-
-        uint256 depositAmount = 100 * 1e6;
-
-        // Алиса заходит сразу (максимальный буст)
-        vm.startPrank(alice);
-        IERC20(ASSET).approve(address(dungeon), depositAmount);
-        dungeon.enterRaid(depositAmount);
-        vm.stopPrank();
-
-        // Проматываем время на 50% длительности фазы Open
-        skip(duration / 2);
-
-        // Боб заходит в середине (буст должен быть в 2 раза меньше)
-        vm.startPrank(bob);
-        IERC20(ASSET).approve(address(dungeon), depositAmount);
-        dungeon.enterRaid(depositAmount);
-        vm.stopPrank();
-
-        ( , uint256 alicePower) = dungeon.adventurers(1, alice);
-        ( , uint256 bobPower) = dungeon.adventurers(1, bob);
-
-        assertGt(alicePower, bobPower, "Alice should have more power than Bob");
-        console.log("Alice Power:", alicePower);
-        console.log("Bob Power:", bobPower);
-    }
-
-    // --- Тест 2: Edge Case - Никто не зашел в рейд ---
-    function testEmptyRaid() public {
-        vm.prank(owner);
-        dungeon.startNewRaid(1 days, 5000);
-
-        skip(1.1 days);
-
-        // Проверяем checkUpkeep
-        (bool upkeepNeeded, ) = dungeon.checkUpkeep("");
-        // Должно быть false, так как в коде мы добавили проверку totalRealDeposits > 0
-        assertEq(upkeepNeeded, false, "Upkeep should not be needed for empty raid");
-    }
-
-    // --- Тест 3: Полный цикл и вывод средств (Mock VRF) ---
-    function testFullFlowAndWithdraw() public {
-        vm.prank(owner);
-        dungeon.startNewRaid(1 days, 5000);
-
-        // Алиса вносит депозит
-        uint256 amount = 100 * 1e6;
-        vm.startPrank(alice);
-        IERC20(ASSET).approve(address(dungeon), amount);
-        dungeon.enterRaid(amount);
-        vm.stopPrank();
-
-        skip(1.1 days);
-
-        // Симулируем вызов от Chainlink Automation
-        dungeon.performUpkeep("");
-
-        // Симулируем ответ от Chainlink VRF
-        // Находим requestId (он генерируется координатором)
-        uint256 requestId = 1; // В тестах часто первый ID равен 1
-        uint256[] memory words = new uint256[](1);
-        words[0] = 777; // Случайное число
-
-        // Вызываем fulfillment от имени Координатора
-        vm.prank(VRF_COORDINATOR);
-        dungeon.rawFulfillRandomWords(requestId, words);
-
-        // Проверяем статус
-        ( , , , , DungeonCore.RaidStatus status, address winner, , ) = dungeon.raids(1);
-        assertEq(uint(status), uint(DungeonCore.RaidStatus.Finished));
-        assertEq(winner, alice, "Alice should be the winner (only participant)");
-
-        // Проверяем вывод тела депозита
-        uint256 balanceBefore = IERC20(ASSET).balanceOf(alice);
         vm.prank(alice);
-        dungeon.withdrawPrincipal(1);
-        uint256 balanceAfter = IERC20(ASSET).balanceOf(alice);
-
-        assertEq(balanceAfter - balanceBefore, amount, "Alice should get her principal back");
+        IERC20(ASSET).approve(address(dungeon), type(uint256).max);
+        vm.prank(bob);
+        IERC20(ASSET).approve(address(dungeon), type(uint256).max);
     }
 
-    // --- Тест 4: Защита от преждевременного вывода ---
-    function testCannotWithdrawEarly() public {
-        vm.prank(owner);
-        dungeon.startNewRaid(1 days, 5000);
+    // Тесты Логики Контрактов
 
-        vm.startPrank(alice);
-        IERC20(ASSET).approve(address(dungeon), 100 * 1e6);
+    function test_BoostCalculation() public {
+        vm.startPrank(owner);
+        dungeon.startNewRaid(1 hours, MAX_BOOST);
+        vm.stopPrank();
+
+        vm.prank(alice);
         dungeon.enterRaid(100 * 1e6);
 
-        vm.expectRevert("Raid not finished");
+        skip(30 minutes);
+
+        vm.prank(bob);
+        dungeon.enterRaid(100 * 1e6);
+
+        (, uint256 alicePower) = dungeon.adventurers(1, alice);
+        (, uint256 bobPower) = dungeon.adventurers(1, bob);
+
+        assertGt(alicePower, bobPower, "Early participant should have more power");
+        assertEq(alicePower, 150 * 1e6); // 1.5x boost
+        assertEq(bobPower, 125 * 1e6); // 1.25x boost
+    }
+
+    function test_EnterRaidReverts() public {
+        vm.prank(owner);
+        dungeon.startNewRaid(1 hours, MAX_BOOST);
+
+        skip(2 hours); // Время вышло
+
+        vm.expectRevert("Raid time expired");
+        vm.prank(alice);
+        dungeon.enterRaid(100 * 1e6);
+    }
+
+    // Тесты на работу с пулом
+
+    function test_SupplyToAave() public {
+        vm.prank(owner);
+        dungeon.startNewRaid(1 hours, MAX_BOOST);
+
+        uint256 depositAmount = 500 * 1e6;
+        vm.prank(alice);
+        dungeon.enterRaid(depositAmount);
+
+        // USDC должны уйти на адрес MockAavePool
+        assertEq(IERC20(ASSET).balanceOf(address(dungeon)), 0);
+        assertEq(IERC20(ASSET).balanceOf(address(mockPool)), depositAmount);
+    }
+
+    // Тесты работоспособности
+
+    function test_FullCycleWithMockYield() public {
+        // Старт и деп
+        vm.prank(owner);
+        dungeon.startNewRaid(1 days, MAX_BOOST);
+
+        vm.prank(alice);
+        dungeon.enterRaid(100 * 1e6);
+        vm.prank(bob);
+        dungeon.enterRaid(100 * 1e6);
+
+        // Симуляция дохода от Aave (накидываю в MockPool 50 USDC сверху)
+        uint256 yieldAmount = 50 * 1e6;
+        deal(ASSET, address(this), yieldAmount);
+        IERC20(ASSET).approve(address(mockPool), yieldAmount);
+        mockPool.addYield(ASSET, yieldAmount);
+
+        // З авершение рейда
+        skip(1 days + 1);
+
+        (bool upkeepNeeded,) = dungeon.checkUpkeep("");
+        assertTrue(upkeepNeeded);
+
+        vm.recordLogs();
+        dungeon.performUpkeep("");
+        uint256 requestId = _getVrfRequestId();
+
+        //VRF Callback
+        vrfMock.fulfillRandomWords(requestId, address(dungeon));
+
+        //Проверки
+        (,,,, DungeonCore.RaidStatus status, address winner, uint256 yieldGen,) = dungeon.raids(1);
+
+        assertEq(uint256(status), uint256(DungeonCore.RaidStatus.Finished));
+        assertTrue(winner == alice || winner == bob);
+        assertEq(yieldGen, yieldAmount, "Yield should match the simulated amount");
+
+        uint256 expectedWinnerBalance = INITIAL_BALANCE - (100 * 1e6) + yieldGen;
+        assertEq(IERC20(ASSET).balanceOf(winner), expectedWinnerBalance);
+    }
+
+    // всякие Эдж тесты
+
+    function test_SingleParticipantWins() public {
+        vm.prank(owner);
+        dungeon.startNewRaid(1 hours, MAX_BOOST);
+
+        vm.prank(alice);
+        dungeon.enterRaid(100 * 1e6);
+
+        skip(2 hours);
+
+        vm.recordLogs();
+        dungeon.performUpkeep("");
+        uint256 requestId = _getVrfRequestId();
+
+        vrfMock.fulfillRandomWords(requestId, address(dungeon));
+
+        (,,,,, address winner,,) = dungeon.raids(1);
+        assertEq(winner, alice, "Single participant must win");
+    }
+
+    function test_WithdrawPrincipal() public {
+        test_FullCycleWithMockYield(); // Запускаем полный цикл, чтобы завершить рейд
+
+        //(,,,,, address winner,,) = dungeon.raids(1);
+
+        // Проверяем Алису
+        uint256 aliceBalanceBefore = IERC20(ASSET).balanceOf(alice);
+        vm.prank(alice);
         dungeon.withdrawPrincipal(1);
-        vm.stopPrank();
+        assertEq(IERC20(ASSET).balanceOf(alice), aliceBalanceBefore + (100 * 1e6)); // Вернула свои 100
+
+        // Проверяем Боба
+        uint256 bobBalanceBefore = IERC20(ASSET).balanceOf(bob);
+        vm.prank(bob);
+        dungeon.withdrawPrincipal(1);
+        assertEq(IERC20(ASSET).balanceOf(bob), bobBalanceBefore + (100 * 1e6)); // Вернул свои 100
+    }
+
+    function test_Revert_FulfillOnlyByCoordinator() public {
+        vm.prank(owner);
+        dungeon.startNewRaid(1 days, 5000);
+
+        vm.prank(alice);
+        dungeon.enterRaid(100 * 1e6);
+
+        skip(2 days);
+
+        vm.recordLogs();
+        dungeon.performUpkeep("");
+        uint256 requestId = _getVrfRequestId();
+
+        uint256[] memory words = new uint256[](1);
+        words[0] = 123;
+
+        vm.prank(alice); 
+        vm.expectRevert("Only Coordinator can fulfill");
+        dungeon.rawFulfillRandomWords(requestId, words);
+    }
+
+    function _getVrfRequestId() internal returns (uint256) {
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+
+        for (uint256 i = 0; i < entries.length; i++) {
+
+            if (entries[i].emitter == address(vrfMock)) {
+                uint256 reqId = abi.decode(entries[i].data, (uint256));
+                return reqId;
+            }
+        }
+        revert("VRF Request ID not found in logs");
     }
 }

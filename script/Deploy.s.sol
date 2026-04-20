@@ -9,7 +9,7 @@ contract DeployDungeon is Script {
     // Адреса для Sepolia Testnet
     address constant ASSET = 0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8; // USDC (Aave Sepolia)
     address constant AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2; // Aave V3 Pool
-    address constant VRF_COORDINATOR =0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B;
+    address constant VRF_COORDINATOR = 0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B;
     bytes32 constant KEY_HASH = 0x787d74caea10b2b357790d5b5244c2f63d1d91572a9846f780606e4d953677ae;
     uint256 constant SUB_ID = 56358236429338791114483957913597823340078748010671808189139093886351107633268; // Твой ID подписки Chainlink VRF
 

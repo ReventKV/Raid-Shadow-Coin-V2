@@ -4,22 +4,26 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol"; 
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {VRFV2PlusClient} from "@chainlink-brownie/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
-import {AutomationCompatibleInterface} from "@chainlink-brownie/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
-import {IVRFCoordinatorV2Plus} from "@chainlink-brownie/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+import {
+    AutomationCompatibleInterface
+} from "@chainlink-brownie/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
+import {
+    IVRFCoordinatorV2Plus
+} from "@chainlink-brownie/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPool} from "./interfaces/IPool.sol"; // Интерфейс Aave V3
 
 contract DungeonCore is
-         Initializable, 
-    UUPSUpgradeable, 
-    OwnableUpgradeable, 
-    PausableUpgradeable, 
-    ReentrancyGuard, 
-    AutomationCompatibleInterface {
-    
+    Initializable,
+    UUPSUpgradeable,
+    OwnableUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuard,
+    AutomationCompatibleInterface
+{
     //Переменные для Стейкинга
     IERC20 public asset;
     IPool public pool;
@@ -29,11 +33,15 @@ contract DungeonCore is
     uint256 public s_subscriptionId;
     bytes32 public keyHash;
     uint32 public callbackGasLimit;
-    
-    enum RaidStatus { Open, Closed, Finished }
+
+    enum RaidStatus {
+        Open,
+        Closed,
+        Finished
+    }
 
     struct Adventurer {
-        uint256 realDeposit;   // Сумма для возврата 
+        uint256 realDeposit; // Сумма для возврата
         uint256 weightedPower; // Сумма * буст для лотереи
     }
 
@@ -68,15 +76,12 @@ contract DungeonCore is
         address _initialOwner,
         uint256 _subscriptionId,
         bytes32 _keyHash,
-        address _vrfCoordinator,
-        uint256 _defaultMaxBoost
+        address _vrfCoordinator
     ) public initializer {
-
-        
         // Инициализация базовых контрактов OpenZeppelin
         __Ownable_init(_initialOwner);
         __Pausable_init();
-        
+
         // Инициализация Chainlink VRF (вызов конструктора базового класса вручную)
         // В новых версиях VRFConsumerBaseV2Plus это делается через внутренние переменные
         s_vrfCoordinator = IVRFCoordinatorV2Plus(_vrfCoordinator);
@@ -88,58 +93,54 @@ contract DungeonCore is
         asset = IERC20(_asset);
         pool = IPool(_aavePool);
 
-
         currentRaidId = 0;
 
         // Одобряем пул Aave на бесконечный вывод
         asset.approve(_aavePool, type(uint256).max);
     }
 
-
     // Ограничение функций по состоянию рейда
     modifier onlyInStatus(uint256 _raidId, RaidStatus _status) {
         require(raids[_raidId].status == _status, "Invalid raid status");
         _;
     }
-    
+
     /// @notice Вход в рейд с расчетом временного буста
-    function enterRaid(uint256 _amount) 
-        external 
-        nonReentrant 
-        onlyInStatus(currentRaidId, RaidStatus.Open) {
-            
-            Raid storage raid = raids[currentRaidId];
-            require(block.timestamp < raid.endTime, "Raid time expired");
+    function enterRaid(uint256 _amount) external nonReentrant onlyInStatus(currentRaidId, RaidStatus.Open) {
+        Raid storage raid = raids[currentRaidId];
+        require(block.timestamp < raid.endTime, "Raid time expired");
 
-            asset.transferFrom(msg.sender, address(this), _amount);
-            pool.supply(address(asset), _amount, address(this), 0);
+        asset.transferFrom(msg.sender, address(this), _amount);
+        pool.supply(address(asset), _amount, address(this), 0);
 
-            if (adventurers[currentRaidId][msg.sender].realDeposit == 0) {
-                raid.participants.push(msg.sender);
-            }   
-            // Расчет буста B_t = 1 + (maxBoost * (endTime - current) / (endTime - startTime))
-            // Используем базовые пункты (10000 = 100%) для точности
-            uint256 timeRemaining = raid.endTime - block.timestamp;
-            uint256 duration = raid.endTime - raid.startTime;
-            
-            // Линейно затухающий коэффициент
-            uint256 currentBoost = 10000 + (raid.maxBoost * timeRemaining / duration);
-            uint256 weightedPower = (_amount * currentBoost) / 10000;
+        if (adventurers[currentRaidId][msg.sender].realDeposit == 0) {
+            raid.participants.push(msg.sender);
+        }
+        // Расчет буста B_t = 1 + (maxBoost * (endTime - current) / (endTime - startTime))
+        // Используем базовые пункты (10000 = 100%) для точности
+        uint256 timeRemaining = raid.endTime - block.timestamp;
+        uint256 duration = raid.endTime - raid.startTime;
 
-            adventurers[currentRaidId][msg.sender].realDeposit += _amount;
-            adventurers[currentRaidId][msg.sender].weightedPower += weightedPower;  
+        // Линейно затухающий коэффициент
+        uint256 currentBoost = 10000 + (raid.maxBoost * timeRemaining / duration);
+        uint256 weightedPower = (_amount * currentBoost) / 10000;
 
-            // Обновление состояния (упрощенно)
-            raid.totalRealDeposits += _amount;
-            raid.totalWeightedPower += weightedPower;
+        adventurers[currentRaidId][msg.sender].realDeposit += _amount;
+        adventurers[currentRaidId][msg.sender].weightedPower += weightedPower;
+
+        // Обновление состояния (упрощенно)
+        raid.totalRealDeposits += _amount;
+        raid.totalWeightedPower += weightedPower;
     }
 
-
-    function checkUpkeep(bytes calldata /* checkData */) 
-        external 
-        view 
-        override 
-        returns (bool upkeepNeeded, bytes memory performData) {
+    function checkUpkeep(
+        bytes calldata /* checkData */
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
         Raid storage raid = raids[currentRaidId];
         // Условие: время вышло, но рейд всё ещё открыт
         upkeepNeeded = (block.timestamp >= raid.endTime && raid.status == RaidStatus.Open);
@@ -148,12 +149,19 @@ contract DungeonCore is
     /**
      * @dev Выполнение перехода состояния и запрос рандома
      */
-    function performUpkeep(bytes calldata /* performData */) 
-        external 
-        override {
+    function performUpkeep(
+        bytes calldata /* performData */
+    )
+        external
+        override
+    {
         Raid storage raid = raids[currentRaidId];
-        require(block.timestamp >= raid.endTime && raid.status == RaidStatus.Open, "Condition not meet: too early or too late");
-        if (raid.totalRealDeposits > 0 ) {raid.status = RaidStatus.Closed; return;} 
+        require(
+            block.timestamp >= raid.endTime && raid.status == RaidStatus.Open,
+            "Condition not meet: too early or too late"
+        );
+        if (raid.totalRealDeposits == 0) raid.status = RaidStatus.Finished;
+        return;
         raid.status = RaidStatus.Closed;
 
         // Запрос случайного числа у Chainlink VRF
@@ -171,8 +179,8 @@ contract DungeonCore is
         vrfRequestToRaid[requestId] = currentRaidId;
     }
 
-   /**
-     * @dev Эту функцию вызывает VRFCoordinator. 
+    /**
+     * @dev Эту функцию вызывает VRFCoordinator.
      * Мы реализуем её вручную, чтобы избежать конфликтов наследования.
      */
     function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
@@ -201,15 +209,14 @@ contract DungeonCore is
         raid.winner = winner;
         _finishRaid(raidId);
     }
-    
 
     function _finishRaid(uint256 _raidId) internal {
         Raid storage raid = raids[_raidId];
-        
+
         // Выводим ВСЕ средства из Aave (тело + доход)
         // В Aave V3 вывод max uint256 выводит весь баланс aToken
         uint256 totalBalance = pool.withdraw(address(asset), type(uint256).max, address(this));
-        
+
         raid.yieldGenerated = totalBalance - raid.totalRealDeposits;
         raid.status = RaidStatus.Finished;
 
@@ -220,7 +227,6 @@ contract DungeonCore is
 
         emit WinnerSelected(_raidId, raid.winner, raid.yieldGenerated);
     }
-
 
     /**
      * @notice Пользователи забирают свои депозиты после завершения рейда
@@ -234,17 +240,13 @@ contract DungeonCore is
         asset.transfer(msg.sender, amount);
     }
 
-    
     function startNewRaid(uint256 _duration, uint256 _maxBoost) external onlyOwner {
-    // Убеждаемся, что текущий рейд либо не существует (самый первый), 
-    // либо уже полностью завершен
-        require(
-            currentRaidId == 0 || raids[currentRaidId].status == RaidStatus.Finished, 
-            "Previous raid still active"
-        );
+        // Убеждаемся, что текущий рейд либо не существует (самый первый),
+        // либо уже полностью завершен
+        require(currentRaidId == 0 || raids[currentRaidId].status == RaidStatus.Finished, "Previous raid still active");
 
         currentRaidId++;
-        
+
         Raid storage newRaid = raids[currentRaidId];
         newRaid.startTime = block.timestamp;
         newRaid.endTime = block.timestamp + _duration;
@@ -252,10 +254,14 @@ contract DungeonCore is
         newRaid.status = RaidStatus.Open;
 
         emit RaidStarted(currentRaidId, newRaid.endTime, _maxBoost);
-    }   
+    }
 
+    function pause() external onlyOwner {
+        _pause();
+    }
 
-    function pause() external onlyOwner { _pause(); }
-    function unpause() external onlyOwner { _unpause(); }
-    function _authorizeUpgrade(address newImplementation) internal virtual override onlyOwner {}
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

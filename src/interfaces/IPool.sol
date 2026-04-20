@@ -9,12 +9,7 @@ interface IPool {
      * @param onBehalfOf Адрес, который получит aTokens (в нашем случае address(this))
      * @param referralCode Код реферала (передаем 0)
      */
-    function supply(
-        address asset,
-        uint256 amount,
-        address onBehalfOf,
-        uint16 referralCode
-    ) external;
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
 
     /**
      * @notice Выводит `amount` базового актива из резерва, сжигая эквивалентные aTokens.
@@ -23,9 +18,5 @@ interface IPool {
      * @param to Адрес, который получит базовый актив
      * @return Финальная выведенная сумма
      */
-    function withdraw(
-        address asset,
-        uint256 amount,
-        address to
-    ) external returns (uint256);
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }
