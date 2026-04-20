@@ -211,7 +211,7 @@ contract DungeonCoreTest is Test {
         uint256[] memory words = new uint256[](1);
         words[0] = 123;
 
-        vm.prank(alice); 
+        vm.prank(alice);
         vm.expectRevert("Only Coordinator can fulfill");
         dungeon.rawFulfillRandomWords(requestId, words);
     }
@@ -220,7 +220,6 @@ contract DungeonCoreTest is Test {
         Vm.Log[] memory entries = vm.getRecordedLogs();
 
         for (uint256 i = 0; i < entries.length; i++) {
-
             if (entries[i].emitter == address(vrfMock)) {
                 uint256 reqId = abi.decode(entries[i].data, (uint256));
                 return reqId;
