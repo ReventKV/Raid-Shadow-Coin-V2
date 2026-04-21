@@ -160,8 +160,10 @@ contract DungeonCore is
             block.timestamp >= raid.endTime && raid.status == RaidStatus.Open,
             "Condition not meet: too early or too late"
         );
-        if (raid.totalRealDeposits == 0) raid.status = RaidStatus.Finished;
-        return;
+        if (raid.totalRealDeposits == 0) {
+            raid.status = RaidStatus.Finished;
+            return;
+        }
         raid.status = RaidStatus.Closed;
 
         // Запрос случайного числа у Chainlink VRF
